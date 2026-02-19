@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "Direct3D12Demo (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "Direct3D12Demo (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
