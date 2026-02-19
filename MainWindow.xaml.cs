@@ -1,10 +1,14 @@
 ﻿using System;
+using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
-using Direct3D12Demo;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Media;
+using Vortice.D3DCompiler;
+using Vortice.Direct3D;
 using Vortice.Direct3D12;
+using Vortice.Direct3D12.Debug;
 using Vortice.DXGI;
 using Vortice.Mathematics;
 using static Vortice.Direct3D12.D3D12;
@@ -34,8 +38,42 @@ public sealed partial class MainWindow : Window
     private ID3D12Fence _fence;
     private ulong _fenceValue;
     private IntPtr _fenceEvent;
+    private readonly ulong[] _frameFenceValues = new ulong[FrameCount];
+
     private uint _rtvDescriptorSize;
     private uint _frameIndex;
+
+
+
+    // GPU pipeline
+    private ID3D12RootSignature _rootSignature;
+    private ID3D12PipelineState _pipelineState;
+
+    // Geometry
+    private ID3D12Resource _vertexBuffer;
+    private VertexBufferView _vertexBufferView;
+
+    // Constant buffer
+    private ID3D12DescriptorHeap _cbvHeap;
+    private ID3D12Resource _constantBuffer;
+    private IntPtr _constantBufferPtr;
+
+    // Animation
+    private float _angleDegrees = 0f;
+
+    // Vertex struct
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Vertex
+    {
+        public Vector2 Position;
+        public Vector4 Color;
+
+        public Vertex(float x, float y, Vector4 color)
+        {
+            Position = new Vector2(x, y);
+            Color = color;
+        }
+    }
 
     public MainWindow()
     {
@@ -55,11 +93,24 @@ public sealed partial class MainWindow : Window
 
     private async Task InitializeD3DAsync()
     {
+#if DEBUG
+        if (D3D12.D3D12GetDebugInterface(out ID3D12Debug debug).Success)
+        {
+            debug.EnableDebugLayer();
+
+            // Optional: GPU-based validation
+            if (debug.QueryInterface<ID3D12Debug1>() is ID3D12Debug1 debug1)
+            {
+                debug1.SetEnableGPUBasedValidation(true);
+            }
+        }
+#endif
+
         // Create DXGI factory
         _dxgiFactory = CreateDXGIFactory2<IDXGIFactory4>(false);
 
         // Create device
-        _device = D3D12CreateDevice<ID3D12Device>(null, Vortice.Direct3D.FeatureLevel.Level_11_0);
+        _device = D3D12CreateDevice<ID3D12Device>(null, FeatureLevel.Level_11_0);
 
         // Create command queue
         var queueDesc = new CommandQueueDescription(CommandListType.Direct);
@@ -98,13 +149,221 @@ public sealed partial class MainWindow : Window
 
         // Fence
         _fence = _device.CreateFence(0);
-        _fenceValue = 1;
+        _fenceValue = 0;
+        for (int i = 0; i < FrameCount; i++)
+            _frameFenceValues[i] = 0;
+    
         _fenceEvent = CreateEventEx(IntPtr.Zero, null, 0, 0);
 
         _frameIndex = _swapChain.CurrentBackBufferIndex;
 
+        CreatePipelineAndResources();
+
+
         await Task.CompletedTask;
     }
+
+    private void CreatePipelineAndResources()
+    {
+        //
+        // 1. Root signature (one CBV at register b0, space 0)
+        //
+        // Root parameter: CBV at register b0, space 0
+        var rootParam = new RootParameter1(
+            RootParameterType.ConstantBufferView,
+            new RootDescriptor1(0, 0),
+            ShaderVisibility.Vertex
+        );
+
+        // Root signature description (version 1.1)
+        var rootSigDesc = new RootSignatureDescription1(
+            RootSignatureFlags.AllowInputAssemblerInputLayout,
+            new[] { rootParam },
+            Array.Empty<StaticSamplerDescription>()
+        );
+
+        // Create the root signature
+        _rootSignature = _device.CreateRootSignature(rootSigDesc);
+
+
+        //
+        // 2. HLSL shaders
+        //
+        string vsSource = @"
+cbuffer Transform : register(b0)
+{
+    float4x4 gWorld;
+};
+
+struct VSInput
+{
+    float2 pos : POSITION;
+    float4 col : COLOR;
+};
+
+struct PSInput
+{
+    float4 pos : SV_POSITION;
+    float4 col : COLOR;
+};
+
+PSInput main(VSInput input)
+{
+    PSInput o;
+    o.pos = mul(float4(input.pos, 0.0f, 1.0f), gWorld);
+    o.col = input.col;
+    return o;
+}
+";
+
+        string psSource = @"
+struct PSInput
+{
+    float4 pos : SV_POSITION;
+    float4 col : COLOR;
+};
+
+float4 main(PSInput input) : SV_TARGET
+{
+    return input.col;
+}
+";
+
+        using Blob vsBlob = Compiler.Compile(
+            vsSource,
+            entryPoint: "main",
+            sourceName: null,
+            macros: null,
+            include: null,
+            profile: "vs_5_0",
+            ShaderFlags.None,
+            EffectFlags.None
+        );
+
+        using Blob psBlob = Compiler.Compile(
+            psSource,
+            entryPoint: "main",
+            sourceName: null,
+            macros: null,
+            include: null,
+            profile: "ps_5_0",
+            ShaderFlags.None,
+            EffectFlags.None
+        );
+
+
+        //
+        // 3. Input layout
+        //
+        var inputElements = new[]
+        {
+        new InputElementDescription("POSITION", 0, Format.R32G32_Float,       0, 0),
+        new InputElementDescription("COLOR",    0, Format.R32G32B32A32_Float, 8, 0),
+    };
+
+        //
+        // 4. Pipeline state
+        //
+        var psoDesc = new GraphicsPipelineStateDescription
+        {
+            RootSignature = _rootSignature,
+            VertexShader = vsBlob.AsBytes(),
+            PixelShader = psBlob.AsBytes(),
+            InputLayout = new InputLayoutDescription(inputElements),
+            BlendState = BlendDescription.Opaque,
+            RasterizerState = RasterizerDescription.CullNone,
+            DepthStencilState = DepthStencilDescription.None,
+            SampleMask = uint.MaxValue,
+            PrimitiveTopologyType = PrimitiveTopologyType.Triangle,
+            SampleDescription = new SampleDescription(1, 0),
+        };
+
+        // Older-style RTV setup
+        psoDesc.RenderTargetFormats[0] = Format.R8G8B8A8_UNorm;
+
+        _pipelineState = _device.CreateGraphicsPipelineState(psoDesc);
+
+        //
+        // 5. Vertex buffer (rectangle in NDC)
+        //
+        var color = new Vector4(0.9f, 0.3f, 0.1f, 1.0f);
+
+        var vertices = new[]
+        {
+            new Vertex(-0.3f, -0.2f, color),
+            new Vertex( 0.3f, -0.2f, color),
+            new Vertex( 0.3f,  0.2f, color),
+
+            new Vertex(-0.3f, -0.2f, color),
+            new Vertex( 0.3f,  0.2f, color),
+            new Vertex(-0.3f,  0.2f, color),
+        };
+
+        uint vbSize = (uint)(Marshal.SizeOf<Vertex>() * vertices.Length);
+
+        _vertexBuffer = _device.CreateCommittedResource(
+            new HeapProperties(HeapType.Upload),
+            HeapFlags.None,
+            ResourceDescription.Buffer((ulong)vbSize),
+            ResourceStates.GenericRead);
+
+        IntPtr vbPtr;
+        unsafe
+        {
+            void* pData = null;
+            _vertexBuffer.Map(0, null, &pData);
+            vbPtr = (IntPtr)pData;
+        }
+
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            Marshal.StructureToPtr(vertices[i], vbPtr + i * Marshal.SizeOf<Vertex>(), false);
+        }
+
+        _vertexBuffer.Unmap(0, null);
+
+
+        _vertexBufferView = new VertexBufferView
+        {
+            BufferLocation = _vertexBuffer.GPUVirtualAddress,
+            SizeInBytes = vbSize,
+            StrideInBytes = (uint)Marshal.SizeOf<Vertex>()
+        };
+
+        //
+        // 6. Constant buffer + CBV
+        //
+        uint cbSize = (uint)((Marshal.SizeOf<Matrix4x4>() + 255) & ~255); // 256-byte aligned
+
+        _constantBuffer = _device.CreateCommittedResource(
+            new HeapProperties(HeapType.Upload),
+            HeapFlags.None,
+            ResourceDescription.Buffer(cbSize),
+            ResourceStates.GenericRead);
+
+        unsafe
+        {
+            void* pData = null;
+            _constantBuffer.Map(0, null, &pData);
+            _constantBufferPtr = (IntPtr)pData;
+        }
+
+        var cbvHeapDesc = new DescriptorHeapDescription(
+            DescriptorHeapType.ConstantBufferViewShaderResourceViewUnorderedAccessView,
+            1,
+            DescriptorHeapFlags.ShaderVisible);
+
+        _cbvHeap = _device.CreateDescriptorHeap(cbvHeapDesc);
+
+        var cbvDesc = new ConstantBufferViewDescription
+        {
+            BufferLocation = _constantBuffer.GPUVirtualAddress,
+            SizeInBytes = cbSize
+        };
+
+        _device.CreateConstantBufferView(cbvDesc, _cbvHeap.GetCPUDescriptorHandleForHeapStart());
+    }
+
 
     private void CreateSwapChainForPanel()
     {
@@ -139,53 +398,89 @@ public sealed partial class MainWindow : Window
 
     private void StartRenderLoop()
     {
-        CompositionTarget.Rendering += (_, __) => Render();
+        CompositionTarget.Rendering += (_, __) =>
+        {
+            try
+            {
+                Render();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex.ToString());
+                throw; // or comment this out to keep the app running
+            }
+        };
     }
 
     private void Render()
     {
-        // Reset
         _commandAllocator.Reset();
-        _commandList.Reset(_commandAllocator, null);
+        _commandList.Reset(_commandAllocator, _pipelineState);
 
         // Transition to render target
         var barrierToRT = ResourceBarrier.BarrierTransition(
             _renderTargets[_frameIndex],
             ResourceStates.Present,
-            ResourceStates.RenderTarget
-        );
+            ResourceStates.RenderTarget);
 
         _commandList.ResourceBarrier(barrierToRT);
 
-        // Get RTV handle
+        // RTV handle
         var rtvHandle = _rtvHeap.GetCPUDescriptorHandleForHeapStart();
         rtvHandle = rtvHandle.Offset((int)_frameIndex, _rtvDescriptorSize);
 
-        // Clear background (e.g., dark blue)
+        // Clear background
         var clearColor = new Color4(0.1f, 0.2f, 0.4f, 1.0f);
         _commandList.ClearRenderTargetView(rtvHandle, clearColor);
 
-        // Clear a smaller rectangle with another color to simulate a rectangle
-        var rect = new Vortice.RawRect(100, 100, 400, 300);
+        // Viewport + scissor
+        _commandList.RSSetViewport(new Viewport(
+            0, 0,
+            (float)_swapChain.Description1.Width,
+            (float)_swapChain.Description1.Height));
 
-        var rectColor = new Color4(0.9f, 0.3f, 0.1f, 1.0f);
-        _commandList.ClearRenderTargetView(rtvHandle, rectColor, [rect]);
+        _commandList.RSSetScissorRect(new Vortice.RawRect(
+            0, 0,
+            (int)_swapChain.Description1.Width,
+            (int)_swapChain.Description1.Height));
 
-        // Transition: RenderTarget → Present
+        // Set render target
+        _commandList.OMSetRenderTargets(rtvHandle);
+
+        // Root signature + CBV heap
+        _commandList.SetGraphicsRootSignature(_rootSignature);
+        _commandList.SetDescriptorHeaps([_cbvHeap]);
+        _commandList.SetGraphicsRootConstantBufferView(0, _constantBuffer.GPUVirtualAddress);
+
+        //
+        // Update rotation matrix
+        //
+        _angleDegrees += 1f;
+        if (_angleDegrees >= 360f) _angleDegrees -= 360f;
+
+        float rad = (float)(_angleDegrees * Math.PI / 180.0);
+        Matrix4x4 world = Matrix4x4.CreateRotationZ(rad);
+
+        Marshal.StructureToPtr(world, _constantBufferPtr, false);
+
+        // IA setup
+        _commandList.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+        _commandList.IASetVertexBuffers(0, _vertexBufferView);
+
+        // Draw 6 vertices (2 triangles)
+        _commandList.DrawInstanced(6, 1, 0, 0);
+
+        // Transition back to present
         var barrierToPresent = ResourceBarrier.BarrierTransition(
             _renderTargets[_frameIndex],
             ResourceStates.RenderTarget,
-            ResourceStates.Present
-        );
+            ResourceStates.Present);
 
         _commandList.ResourceBarrier(barrierToPresent);
 
         _commandList.Close();
 
-        // Execute
         _commandQueue.ExecuteCommandList(_commandList);
-
-        // Present
         _swapChain.Present(1, PresentFlags.None);
 
         MoveToNextFrame();
@@ -193,18 +488,22 @@ public sealed partial class MainWindow : Window
 
     private void MoveToNextFrame()
     {
-        var currentFence = _fenceValue;
-        _commandQueue.Signal(_fence, currentFence);
+        // Signal for the frame we just submitted
         _fenceValue++;
+        _commandQueue.Signal(_fence, _fenceValue);
+        _frameFenceValues[_frameIndex] = _fenceValue;
 
-        if (_fence.CompletedValue < currentFence)
+        // Advance to next back buffer
+        _frameIndex = _swapChain.CurrentBackBufferIndex;
+
+        // If the next frame is not ready, wait for it
+        if (_fence.CompletedValue < _frameFenceValues[_frameIndex])
         {
-            _fence.SetEventOnCompletion(currentFence, _fenceEvent);
+            _fence.SetEventOnCompletion(_frameFenceValues[_frameIndex], _fenceEvent);
             WaitForSingleObject(_fenceEvent, unchecked((int)0xFFFFFFFF));
         }
-
-        _frameIndex = _swapChain.CurrentBackBufferIndex;
     }
+
 
     private void DxPanel_SizeChanged(object sender, SizeChangedEventArgs e)
     {
